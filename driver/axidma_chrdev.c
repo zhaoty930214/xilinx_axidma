@@ -35,7 +35,9 @@
  *----------------------------------------------------------------------------*/
 
 // TODO: Maybe this can be improved?
-static struct axidma_device *axidma_dev;
+// static struct axidma_device *axidma_dev;
+
+static LIST_HEAD(list_device);
 
 // A structure that represents a DMA buffer allocation
 struct axidma_dma_allocation {
@@ -44,6 +46,7 @@ struct axidma_dma_allocation {
     void *kern_addr;            // Kernel virtual address of the buffer
     dma_addr_t dma_addr;        // DMA bus address of the buffer
     struct list_head list;      // List node pointers for allocation list
+    dev_t   dev_id;             // Device ID.
 };
 
 /* A structure that represents a DMA buffer allocation imported from another
@@ -208,16 +211,22 @@ static void axidma_vma_close(struct vm_area_struct *vma)
     struct axidma_device *dev;
     struct axidma_dma_allocation *dma_alloc;
 
-    // Get the AXI DMA allocation data and free the DMA buffer
-    dev = axidma_dev;
     dma_alloc = vma->vm_private_data;
-    dma_free_coherent(&dev->pdev->dev, dma_alloc->size, dma_alloc->kern_addr,
-                      dma_alloc->dma_addr);
 
-    // Remove the allocation from the list, and free the structure
-    list_del(&dma_alloc->list);
-    kfree(dma_alloc);
+    // Get the AXI DMA allocation data and free the DMA buffer
+    list_for_each_entry(dev, &list_device, device_entry)
+    {
+        if(dev->dev_num == dma_alloc->dev_id)
+        {
+            dma_free_coherent(&dev->pdev->dev, dma_alloc->size, dma_alloc->kern_addr,
+                    dma_alloc->dma_addr);
 
+            // Remove the allocation from the list, and free the structure
+            list_del(&dma_alloc->list);
+            kfree(dma_alloc);
+            break;
+        }
+    }
     return;
 }
 
@@ -232,6 +241,8 @@ static const struct vm_operations_struct axidma_vm_ops = {
 
 static int axidma_open(struct inode *inode, struct file *file)
 {
+    struct axidma_device *dev;
+
     // Only the root user can open this device, and it must be exclusive
     if (!capable(CAP_SYS_ADMIN)) {
         axidma_err("Only root can open this device.");
@@ -242,7 +253,14 @@ static int axidma_open(struct inode *inode, struct file *file)
     }
 
     // Place the axidma structure in the private data of the file
-    file->private_data = (void *)axidma_dev;
+    list_for_each_entry(dev, &list_device, device_entry)
+    {
+        if(dev->dev_num == inode->i_rdev)
+        {
+            file->private_data = dev;
+        }
+    }
+    // file->private_data = (void *)axidma_dev;
     return 0;
 }
 
@@ -269,6 +287,9 @@ static int axidma_mmap(struct file *file, struct vm_area_struct *vma)
         goto ret;
     }
 
+    // Set device ID
+    dma_alloc->dev_id = dev->dev_num;
+
     // Set the user virtual address and the size
     dma_alloc->size = vma->vm_end - vma->vm_start;
     dma_alloc->user_addr = (void *)vma->vm_start;
@@ -286,6 +307,10 @@ static int axidma_mmap(struct file *file, struct vm_area_struct *vma)
                    "kernel command line, and the size is large enough.\n");
         rc = -ENOMEM;
         goto free_vma_data;
+    }
+    else
+    {
+        axidma_info("Allocated kern_addr=%p\r\n", dma_alloc->kern_addr);
     }
 
     // Map the region into userspace
@@ -543,33 +568,47 @@ static const struct file_operations axidma_fops = {
  * Initialization and Cleanup
  *----------------------------------------------------------------------------*/
 
+static int dev_cnt=0;
+static struct class *pclass;
+static dev_t gdev_id;
+
 int axidma_chrdev_init(struct axidma_device *dev)
 {
     int rc;
 
     // Store a global pointer to the axidma device
-    axidma_dev = dev;
+    // axidma_dev = dev;
+    
+    if(dev_cnt == 0)
+    {
+        // Allocate a major and minor number region for the character device
+        rc = alloc_chrdev_region(&gdev_id, dev->minor_num, dev->num_devices,
+                                dev->chrdev_name);
+        if (rc < 0) {
+            axidma_err("Unable to allocate character device region.\n");
+            goto ret;
+        }
 
-    // Allocate a major and minor number region for the character device
-    rc = alloc_chrdev_region(&dev->dev_num, dev->minor_num, dev->num_devices,
-                             dev->chrdev_name);
-    if (rc < 0) {
-        axidma_err("Unable to allocate character device region.\n");
-        goto ret;
+        // Create a device class for our device
+        // dev->dev_class = class_create(THIS_MODULE, dev->chrdev_name);
+        pclass = class_create(THIS_MODULE, dev->chrdev_name);
+        if (IS_ERR(dev->dev_class)) {
+            axidma_err("Unable to create a device class.\n");
+            rc = PTR_ERR(dev->dev_class);
+            goto free_chrdev_region;
+        }
     }
 
-    // Create a device class for our device
-    dev->dev_class = class_create(THIS_MODULE, dev->chrdev_name);
-    if (IS_ERR(dev->dev_class)) {
-        axidma_err("Unable to create a device class.\n");
-        rc = PTR_ERR(dev->dev_class);
-        goto free_chrdev_region;
-    }
+    dev->dev_num = MKDEV(MAJOR(gdev_id), dev_cnt);
+    dev->dev_class = pclass;
+
 
     /* Create a device for our module. This will create a file on the
      * filesystem, under "/dev/dev->chrdev_name". */
     dev->device = device_create(dev->dev_class, NULL, dev->dev_num, NULL,
-                                dev->chrdev_name);
+                                CHRDEV_NAME"%d", dev_cnt);
+    dev_cnt++;
+                            
     if (IS_ERR(dev->device)) {
         axidma_err("Unable to create a device.\n");
         rc = PTR_ERR(dev->device);
@@ -587,6 +626,7 @@ int axidma_chrdev_init(struct axidma_device *dev)
     // Initialize the list for DMA mmap'ed allocations
     INIT_LIST_HEAD(&dev->dmabuf_list);
     INIT_LIST_HEAD(&dev->external_dmabufs);
+    list_add(&dev->device_entry, &list_device);
 
     return 0;
 
@@ -602,10 +642,14 @@ ret:
 
 void axidma_chrdev_exit(struct axidma_device *dev)
 {
+    dev_cnt--;
     // Cleanup all related character device structures
     cdev_del(&dev->chrdev);
     device_destroy(dev->dev_class, dev->dev_num);
-    class_destroy(dev->dev_class);
+    if(dev_cnt == 0)
+    {
+        class_destroy(dev->dev_class);
+    }
     unregister_chrdev_region(dev->dev_num, dev->num_devices);
 
     return;
